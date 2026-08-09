@@ -1,0 +1,13 @@
+# MLflow + драйвер Postgres.
+#
+# Официальный образ ghcr.io/mlflow/mlflow идёт без psycopg2, поэтому
+# `--backend-store-uri postgresql://...` в нём падает на старте с
+# ModuleNotFoundError. Ставим драйвер сами — иначе пришлось бы держать
+# метаданные экспериментов в sqlite внутри контейнера, что для «прод-подобного»
+# окружения неправильно: база должна переживать пересоздание контейнера.
+
+FROM ghcr.io/mlflow/mlflow:v2.16.2
+
+RUN pip install --no-cache-dir psycopg2-binary==2.9.9
+
+EXPOSE 5000

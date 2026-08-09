@@ -1,0 +1,59 @@
+features:
+  # Все лаги/окна ОБЯЗАНЫ быть >= horizon, иначе на inference их нечем посчитать
+  # и получается утечка на валидации.
+  horizon_shift: 28
+
+  lags: [28, 35, 42, 56, 364]
+
+  rolling:
+    windows: [7, 28, 180]
+    aggs: [mean, std, max]
+    shift: 28              # окна считаются по данным, сдвинутым на горизонт
+
+  calendar:
+    - dayofweek
+    - dayofmonth
+    - weekofyear
+    - month
+    - year
+    - is_weekend
+    - event_name_1
+    - event_type_1
+    - event_name_2
+    - event_type_2
+    - snap_CA
+    - snap_TX
+    - snap_WI
+    - days_to_next_event
+    - days_since_prev_event
+
+  price:
+    - sell_price
+    - price_change_1w
+    - price_rel_item_mean
+    - price_rel_store_mean
+    - price_momentum_4w
+    - days_since_first_price   # прокси «товар появился в ассортименте»
+    - price_nunique_item
+
+  hierarchy: [item_id, dept_id, cat_id, store_id, state_id]
+
+  external:
+    weather: true
+    holidays: true
+
+  categorical:
+    - item_id
+    - dept_id
+    - cat_id
+    - store_id
+    - state_id
+    - event_name_1
+    - event_type_1
+    - event_name_2
+    - event_type_2
+    - holiday_name
+
+  target: sales
+  # Строки, где товара ещё не было в продаже, выкидываем из train
+  drop_pre_release_rows: true

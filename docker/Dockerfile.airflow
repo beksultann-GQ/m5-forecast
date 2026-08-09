@@ -1,0 +1,25 @@
+# Airflow + пакет m5. DAG'и вызывают CLI `m5`, значит он должен быть в образе.
+#
+# Базовый образ apache/airflow публикуется в том числе под arm64 —
+# на Apple Silicon работает нативно.
+
+FROM apache/airflow:2.10.2-python3.12
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+        build-essential \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+USER airflow
+
+ENV M5_REPO_ROOT=/opt/m5
+
+COPY --chown=airflow:root pyproject.toml /opt/m5/
+COPY --chown=airflow:root src/ /opt/m5/src/
+COPY --chown=airflow:root conf/ /opt/m5/conf/
+
+# Ставим проект в окружение Airflow, а не в отдельный venv:
+# так DAG'и могут импортировать m5 напрямую, а BashOperator видит CLI.
+RUN pip install --no-cache-dir -e "/opt/m5[monitoring]"

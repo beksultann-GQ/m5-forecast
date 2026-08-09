@@ -1,0 +1,31 @@
+# Корневой конфиг. Остальные yaml подмешиваются по ключу `defaults`.
+project:
+  name: m5-forecast
+  seed: 42
+  horizon: 28            # длина прогноза, дней
+  timezone: America/Los_Angeles
+
+paths:
+  data_dir: data
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+  external_dir: data/external
+  duckdb_path: data/m5.duckdb
+  sql_dir: src/m5/features/sql
+
+defaults:
+  - data
+  - features
+  - model
+  - external
+  - validation
+
+logging:
+  level: INFO
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+
+mlflow:
+  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,sqlite:///mlflow.db}
+  experiment_name: m5-forecast
+  registered_model_name: m5_lgbm_tweedie

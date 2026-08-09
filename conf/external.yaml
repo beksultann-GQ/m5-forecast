@@ -1,0 +1,64 @@
+# Дополнительные источники данных сверх Kaggle-датасета.
+external:
+  cache_dir: data/external
+  request_timeout_sec: 30
+  max_retries: 5
+  retry_backoff_sec: 2
+
+  weather:
+    enabled: true
+    provider: open_meteo          # open_meteo | visual_crossing
+    # M5 = 3 штата США. Берём по одной репрезентативной точке на штат
+    # (для 10 магазинов гранулярнее данных всё равно нет).
+    locations:
+      - {state_id: CA, city: Los Angeles, lat: 34.0522, lon: -118.2437, tz: America/Los_Angeles}
+      - {state_id: TX, city: Dallas,      lat: 32.7767, lon: -96.7970,  tz: America/Chicago}
+      - {state_id: WI, city: Madison,     lat: 43.0731, lon: -89.4012,  tz: America/Chicago}
+    start_date: "2011-01-29"
+    end_date: null                # null = вчерашний день
+    daily_variables:
+      - temperature_2m_max
+      - temperature_2m_min
+      - temperature_2m_mean
+      - apparent_temperature_max
+      - precipitation_sum
+      - rain_sum
+      - snowfall_sum
+      - windspeed_10m_max
+      - shortwave_radiation_sum
+    unit_system:
+      temperature_unit: celsius
+      precipitation_unit: mm
+      windspeed_unit: kmh
+    derived:
+      - temp_anomaly_vs_doy_norm     # отклонение от нормы по дню года
+      - hdd                          # heating degree days, base 18C
+      - cdd                          # cooling degree days, base 18C
+      - is_heavy_rain                # precipitation_sum > p90
+      - is_snow_day
+      - temp_change_1d
+    # Погода на будущее: на inference за горизонт 28 дней берём forecast API
+    # (Open-Meteo отдаёт до 16 дней), дальше — климатическую норму по дню года.
+    future_strategy: forecast_then_climatology
+    forecast_max_days: 16
+
+  holidays:
+    enabled: true
+    provider: nager_date
+    country_code: US
+    # Nager.Date отдаёт праздники по субдивизиям (ISO-3166-2)
+    subdivisions: [US-CA, US-TX, US-WI]
+    years_from: 2011
+    years_to: 2017
+    derived:
+      - is_holiday
+      - is_public_holiday
+      - holiday_name
+      - is_day_before_holiday
+      - is_day_after_holiday
+      - days_to_next_holiday
+      - days_since_prev_holiday
+      - is_long_weekend
+    # У M5 уже есть event_name_1/2 из calendar.csv — Nager нужен как
+    # независимый источник + региональные праздники по штатам.
+    keep_alongside_m5_events: true

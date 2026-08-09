@@ -1,0 +1,30 @@
+validation:
+  # Rolling origin. Никакого random split.
+  scheme: rolling_origin
+  n_folds: 4
+  horizon: 28
+  gap_days: 28          # между концом train и началом val — иначе лаги протекают
+  step_days: 28         # сдвиг origin между фолдами
+  min_train_days: 730
+
+  # Последний фолд = «боевой» отрезок d_1914..d_1941
+  last_origin_day_index: 1913
+
+metrics:
+  primary: wrmsse
+  secondary: [wmape, mae, rmse, bias]
+
+  wrmsse:
+    # 12 уровней агрегации из соревнования
+    levels: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    # окно, по которому считаются веса (последние 28 дней train по выручке)
+    weight_window_days: 28
+
+data_quality:
+  fail_on_error: true
+  checks:
+    - non_negative_sales
+    - no_duplicate_id_date
+    - continuous_dates
+    - prices_reference_complete
+    - no_future_leakage

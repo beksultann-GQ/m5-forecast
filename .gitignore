@@ -1,0 +1,48 @@
+# data — никогда не коммитим, но структуру каталогов сохраняем
+data/**
+!data/**/
+!data/**/.gitkeep
+
+# duckdb
+*.duckdb
+*.duckdb.wal
+
+# mlflow
+mlruns/
+mlartifacts/
+mlflow.db
+
+# airflow
+airflow.db
+airflow-webserver.pid
+logs/
+dags/__pycache__/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# кеш внешних API
+.cache/
+
+# секреты
+.env
+.env.local
+kaggle.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# notebooks
+.ipynb_checkpoints/

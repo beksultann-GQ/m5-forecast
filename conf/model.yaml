@@ -1,0 +1,45 @@
+model:
+  name: lgbm_tweedie
+
+  # ВНИМАНИЕ: horizon_groups сейчас НЕ используются обучением.
+  # При текущих фичах (все лаги >= 28, считаются относительно даты строки)
+  # один вектор фич валиден для всего горизонта 1..28, поэтому четыре модели
+  # на группах обучались бы на идентичных данных.
+  # Группы заработают, когда минимальный лаг станет параметром витрины:
+  # для h=1..7 законно брать lag_7, для h=8..14 — lag_14 и т.д.
+  # Подробнее — докстринг src/m5/models/train.py.
+  horizon_groups:
+    - {name: h01_07, start: 1, end: 7}
+    - {name: h08_14, start: 8, end: 14}
+    - {name: h15_21, start: 15, end: 21}
+    - {name: h22_28, start: 22, end: 28}
+
+  # Разбиение обучения по магазинам: 10 моделей вместо одной гигантской
+  split_by: store_id       # null | store_id | state_id
+
+  params:
+    objective: tweedie
+    tweedie_variance_power: 1.1
+    metric: rmse
+    boosting_type: gbdt
+    learning_rate: 0.03
+    num_leaves: 128
+    min_data_in_leaf: 100
+    feature_fraction: 0.7
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    lambda_l2: 0.1
+    max_bin: 127
+    num_threads: 0
+    verbosity: -1
+    seed: 42
+
+  training:
+    num_boost_round: 2000
+    early_stopping_rounds: 100
+    log_evaluation_period: 100
+
+baseline:
+  # то, что модель обязана побить
+  name: seasonal_naive
+  lag_days: 28

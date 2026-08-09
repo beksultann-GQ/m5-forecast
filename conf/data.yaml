@@ -1,0 +1,29 @@
+data:
+  kaggle_competition: m5-forecasting-accuracy
+  files:
+    calendar: calendar.csv
+    sell_prices: sell_prices.csv
+    sales_train_evaluation: sales_train_evaluation.csv
+    sample_submission: sample_submission.csv
+
+  # Полный ряд: d_1 .. d_1941 (evaluation). Валидация — d_1914..d_1941.
+  first_day_index: 1
+  last_day_index: 1941
+  validation_start_index: 1914
+
+  # Дата, соответствующая d_1 в calendar.csv
+  origin_date: "2011-01-29"
+
+  # Обрезка «хвоста нулей» до первой продажи товара в магазине.
+  # Нули до первой продажи = товара не было в ассортименте, а не нулевой спрос.
+  trim_leading_zeros: true
+
+  # Сколько последних дней истории держать в витрине фич (экономия памяти).
+  # null = вся история.
+  keep_last_days: 1200
+
+layers:
+  raw: raw          # immutable parquet, как скачали
+  staging: stg      # long-формат + типы + справочники
+  features: ft      # лаги/окна/календарь/цены/внешние
+  mart: mart        # то, что читают train/inference/дашборд

@@ -1,0 +1,149 @@
+# Полное окружение: postgres + mlflow + airflow + api + дашборд.
+#
+# На Apple Silicon все образы ниже есть под arm64 — эмуляция не нужна.
+# Запуск: make up   Остановка: make down   Логи: make logs
+
+name: m5
+
+x-airflow-common: &airflow-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.airflow
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    M5_REPO_ROOT: /opt/m5
+    M5_DUCKDB_PATH: /opt/m5/data/m5.duckdb
+    KAGGLE_USERNAME: ${KAGGLE_USERNAME:-}
+    KAGGLE_KEY: ${KAGGLE_KEY:-}
+  volumes:
+    - ../dags:/opt/airflow/dags
+    - ../data:/opt/m5/data          # данные общие между Airflow и сервисами
+    - ../conf:/opt/m5/conf
+    - ../src:/opt/m5/src
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- хранилище
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-mlflow-db.sql:/docker-entrypoint-initdb.d/init-mlflow-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  # ---------------------------------------------------------------- MLflow
+  mlflow:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mlflow
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://airflow:airflow@postgres:5432/mlflow
+      --default-artifact-root /mlartifacts
+    environment:
+      MLFLOW_HTTP_REQUEST_TIMEOUT: "120"
+    volumes:
+      - mlflow-artifacts:/mlartifacts
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      retries: 5
+
+  # ---------------------------------------------------------------- Airflow
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname admin --lastname admin \
+          --role Admin --email admin@example.com || true
+        airflow pools set training_pool 1 "Обучение: не больше одного одновременно"
+    restart: on-failure
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      retries: 5
+
+  # ---------------------------------------------------------------- сервисы
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: api
+    environment:
+      M5_DUCKDB_PATH: /opt/m5/data/m5.duckdb
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - ../data:/opt/m5/data:ro     # API только читает витрину
+      - ../conf:/opt/m5/conf:ro
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: dashboard
+    environment:
+      M5_DUCKDB_PATH: /opt/m5/data/m5.duckdb
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - ../data:/opt/m5/data:ro
+      - ../conf:/opt/m5/conf:ro
+      - ../dashboards:/opt/m5/dashboards:ro
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  mlflow-artifacts:
+  airflow-logs:
