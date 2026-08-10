@@ -23,3 +23,6 @@ repos:
     rev: 0.7.1
     hooks:
       - id: nbstripout
+        # Черновики EDA чистим, презентационные ноутбуки — нет:
+        # их графики и таблицы и есть результат, который показывают.
+        exclude: ^notebooks/(00_defence|01_qorgau_kz)\.ipynb$

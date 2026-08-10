@@ -64,7 +64,10 @@ SALES_LONG_SCHEMA = DataFrameSchema(
         "store_id": Column(str, nullable=False),
         "state_id": Column(str, Check.isin(STATES), nullable=False),
         "date": Column("datetime64[ns]", nullable=False),
-        "sales": Column(int, Check.ge(0), nullable=False),
+        # nullable по построению: staging строит полную сетку по календарю,
+        # а календарь длиннее продаж на горизонт. У будущих дней факта нет.
+        # Что NULL'ов нет в ПРОШЛОМ — проверяется SQL-инвариантом no_missing_sales_in_past.
+        "sales": Column(float, Check.ge(0), nullable=True),
     },
     unique=["id", "date"],
     strict=False,
@@ -150,44 +153,143 @@ def validate(df, schema_name: str, sample: int | None = None, lazy: bool = True)
     """Проверить датафрейм по именованной схеме.
 
     Args:
-        sample: проверять не весь фрейм, а случайную выборку (59 млн строк
-            прогонять через pandera на каждом запуске дорого).
-        lazy: собрать все ошибки разом, а не падать на первой.
+        sample: проверять не весь фрейм, а случайную выборку. 59 млн строк
+            гонять через pandera на каждом запуске — минуты впустую;
+            на типы и диапазоны выборки хватает.
+        lazy: собрать все ошибки разом, а не падать на первой — иначе
+            чинишь по одной и перезапускаешь пайплайн десять раз.
 
     Raises:
         DataValidationError: с человекочитаемым отчётом.
-
-    TODO: обернуть schema.validate(df, lazy=lazy) и переупаковать
-          pa.errors.SchemaErrors в DataValidationError с топ-10 нарушений.
     """
-    raise NotImplementedError
+    import pandera.errors as pa_errors
+
+    if schema_name not in SCHEMAS:
+        raise KeyError(f"Нет схемы {schema_name!r}. Доступны: {sorted(SCHEMAS)}")
+
+    frame = df
+    if sample and len(df) > sample:
+        frame = df.sample(n=sample, random_state=42)
+        logger.info("Проверяю выборку %s из %s строк", f"{sample:,}", f"{len(df):,}")
+
+    try:
+        SCHEMAS[schema_name].validate(frame, lazy=lazy)
+    except pa_errors.SchemaErrors as exc:
+        raise DataValidationError(_format_schema_errors(exc, schema_name)) from exc
+    except pa_errors.SchemaError as exc:
+        raise DataValidationError(f"Схема {schema_name}: {exc}") from exc
+
+    return frame
 
 
-def validate_duckdb_table(con, table: str, schema_name: str, sample_size: int = 500_000) -> dict:
+def _format_schema_errors(exc, schema_name: str) -> str:
+    """Отчёт об ошибках схемы: что именно и сколько раз."""
+    failures = exc.failure_cases
+    total = len(failures)
+    head = failures.head(10).to_string(index=False)
+    return (
+        f"Данные не прошли схему {schema_name}: {total} нарушений.\n"
+        f"Первые 10:\n{head}\n"
+        f"Пайплайн остановлен намеренно — обучаться на битых данных нельзя."
+    )
+
+
+def validate_duckdb_table(
+    con,
+    table: str,
+    schema_name: str,
+    sample_size: int = 200_000,
+    fail_on_error: bool = True,
+) -> dict[str, Any]:
     """Проверить таблицу DuckDB, не вытаскивая её целиком в память.
 
-    Стратегия: часть проверок делаем SQL-запросами прямо в DuckDB
-    (дубли, отрицательные значения, дыры в датах), а pandera гоняем
-    по случайной выборке — на типы и диапазоны этого хватает.
+    Двухуровневая стратегия:
+        1. инвариантные проверки — SQL'ом прямо в DuckDB (дубли, отрицательные
+           значения, дыры в датах): считаются на всей таблице и почти бесплатно
+        2. типы и диапазоны — pandera по случайной выборке
 
-    TODO:
-        1. прогнать sql_checks() -> нарушения
-        2. con.execute(f"SELECT * FROM {table} USING SAMPLE {sample_size} ROWS").df()
-        3. validate(sample_df, schema_name)
+    Returns:
+        {'table', 'n_rows', 'sql_checks', 'schema_ok'}
+
+    Raises:
+        DataValidationError: если fail_on_error и есть нарушения.
     """
-    raise NotImplementedError
+    n_rows = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    violations = sql_checks(con, table)
+    failed = {name: count for name, count in violations.items() if count}
+
+    for name, count in violations.items():
+        logger.info("  %s %-32s нарушений: %s", "✗" if count else "✓", name, f"{count:,}")
+
+    if failed and fail_on_error:
+        raise DataValidationError(
+            f"Таблица {table} не прошла инвариантные проверки: {failed}.\n"
+            f"Пайплайн остановлен: молча учить модель на битых данных хуже, чем упасть."
+        )
+
+    sample = con.execute(f"SELECT * FROM {table} USING SAMPLE {sample_size} ROWS").df()
+    validate(sample, schema_name)
+
+    return {
+        "table": table,
+        "n_rows": n_rows,
+        "sql_checks": violations,
+        "schema_ok": True,
+    }
 
 
-def sql_checks(con, table: str) -> dict[str, Any]:
-    """Тяжёлые инвариантные проверки — на SQL, а не на pandas.
+def sql_checks(con, table: str) -> dict[str, int]:
+    """Инвариантные проверки на SQL, а не на pandas.
 
-    Проверяем:
-        - нет дублей по (id, date)
-        - нет sales < 0
-        - календарь непрерывен: COUNT(DISTINCT date) == datediff+1
-        - у каждой пары (item, store) в ассортименте есть цена
-        - max(date) не в будущем относительно as_of
+    Считаются на всей таблице средствами DuckDB — это дёшево, в отличие
+    от выгрузки десятков миллионов строк в память.
 
-    TODO: вернуть {check_name: n_violations}, пустые = ок.
+    Returns:
+        {имя_проверки: число_нарушений}. Нули = всё хорошо.
     """
-    raise NotImplementedError
+    columns = {row[0] for row in con.execute(f"DESCRIBE {table}").fetchall()}
+    checks: dict[str, int] = {}
+
+    def scalar(query: str) -> int:
+        row = con.execute(query).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    if {"id", "date"} <= columns:
+        checks["дубли по (id, date)"] = scalar(
+            f"SELECT COUNT(*) FROM (SELECT id, date FROM {table} GROUP BY 1, 2 HAVING COUNT(*) > 1)"
+        )
+
+    if "sales" in columns:
+        checks["отрицательные продажи"] = scalar(f"SELECT COUNT(*) FROM {table} WHERE sales < 0")
+
+        # NULL допустим только на будущих датах (их календарь знает, а факта ещё нет).
+        # NULL в прошлом означает потерянные строки при джойне.
+        checks["пропуски факта в прошлом"] = scalar(
+            f"""
+            SELECT COUNT(*) FROM {table}
+            WHERE sales IS NULL
+              AND date <= (SELECT MAX(date) FROM {table} WHERE sales IS NOT NULL)
+            """
+        )
+
+    if "date" in columns:
+        # Дыра в календаре молча сдвигает все лаги на этом ряду
+        checks["дыры в календаре"] = scalar(
+            f"""
+            SELECT DATEDIFF('day', MIN(date), MAX(date)) + 1 - COUNT(DISTINCT date)
+            FROM {table}
+            """
+        )
+
+    if {"sell_price", "sales"} <= columns:
+        # Товар продаётся, но цены на эту неделю нет — дыра в справочнике
+        checks["продажи без цены"] = scalar(
+            f"SELECT COUNT(*) FROM {table} WHERE sales > 0 AND sell_price IS NULL"
+        )
+
+    if "sell_price" in columns:
+        checks["нулевая или отрицательная цена"] = scalar(
+            f"SELECT COUNT(*) FROM {table} WHERE sell_price <= 0"
+        )
+
+    return checks

@@ -13,9 +13,8 @@ from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.empty import EmptyOperator
-from airflow.operators.python import PythonOperator
 from airflow.sensors.external_task import ExternalTaskSensor
-from common import DEFAULT_ARGS, alert_on_failure, alert_on_sla_miss, m5_command
+from common import DEFAULT_ARGS, alert_on_sla_miss, m5_command
 
 DAG_ID = "m5_inference"
 
@@ -62,36 +61,21 @@ with DAG(
         trigger_rule="all_done",
     )
 
-    predict = m5_command(
-        "predict",
+    # Прогноз и публикация — ОДИН таск, а не два.
+    #
+    # Соблазн разнести «посчитать» и «опубликовать» на разные узлы графа велик:
+    # так нагляднее. Но тогда прогноз считался бы дважды (полный инференс —
+    # не бесплатная операция), а между проверкой и записью появлялось бы окно,
+    # в котором данные могли измениться.
+    #
+    # Sanity-checks живут внутри `m5 model predict`: они выполняются ДО записи
+    # и при провале валят команду, оставляя витрину нетронутой. Fail closed
+    # обеспечивается в коде, а не порядком узлов в графе.
+    forecast = m5_command(
+        "predict_and_publish",
         "model predict --as-of {{ ds }} --stage Production",
+        retries=1,  # один ретрай на случай сетевого сбоя при загрузке модели
     )
-
-    def _sanity_checks(**context) -> None:
-        """Проверки прогноза перед публикацией.
-
-        Что проверяем:
-            - нет NaN и отрицательных значений
-            - число строк == n_series × 28
-            - суммарный объём в пределах ±40% от факта за прошлые 28 дней
-            - все горизонты 1..28 присутствуют
-            - доля climatology в погодных фичах ниже порога
-
-        Raises:
-            SanityCheckError: прогноз в витрину не публикуем, шлём алерт.
-
-        TODO: вызвать m5.models.predict.sanity_checks и m5.monitoring.drift.weather_source_mix.
-        """
-        raise NotImplementedError
-
-    sanity = PythonOperator(
-        task_id="sanity_checks",
-        python_callable=_sanity_checks,
-        on_failure_callback=alert_on_failure,
-        retries=0,
-    )
-
-    publish = m5_command("publish_to_mart", "model predict --as-of {{ ds }} --stage Production")
 
     # Фактическое качество прогноза, сделанного 28 дней назад:
     # только сегодня по нему приехал полный факт.
@@ -102,5 +86,4 @@ with DAG(
     end = EmptyOperator(task_id="end")
 
     start >> wait_for_data >> weather_forecast >> build_features
-    build_features >> predict >> sanity >> publish >> end
-    publish >> [actual_quality, drift] >> end
+    build_features >> forecast >> [actual_quality, drift] >> end

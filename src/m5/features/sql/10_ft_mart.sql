@@ -128,7 +128,10 @@ LEFT JOIN ft.rolling_agg ra ON ra.store_id = e.store_id
 LEFT JOIN ft.weather     w  ON w.state_id = e.state_id AND w.date = e.date
 LEFT JOIN ft.holidays    h  ON h.state_id = e.state_id AND h.date = e.date
 
-WHERE e.date <= DATE '{{ as_of }}'
+-- ft_max_date = as_of (обучение) либо as_of + horizon (инференс).
+-- На инференсе последние 28 дней имеют sales = NULL — это и есть строки,
+-- по которым модель будет предсказывать.
+WHERE e.date <= DATE '{{ ft_max_date }}'
   AND {{ store_filter }}
   -- строки, где товара ещё не было в ассортименте, в обучение не идут
   AND e.days_since_first_sale >= 0;

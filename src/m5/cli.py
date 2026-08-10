@@ -281,27 +281,70 @@ def model_predict(
     as_of: AsOfOpt = None,
     stage: Annotated[str, typer.Option(help="Стадия модели в registry")] = "Production",
     submission: Annotated[str | None, typer.Option(help="Путь для Kaggle submission.csv")] = None,
+    no_write: Annotated[
+        bool, typer.Option("--no-write", help="Посчитать и проверить, но не публиковать")
+    ] = False,
 ) -> None:
-    """Прогноз на 28 дней -> mart.forecast."""
+    """Прогноз на 28 дней -> mart.forecast.
+
+    Sanity-checks выполняются ВНУТРИ и гейтят запись: при провале любой проверки
+    команда падает, а витрина остаётся нетронутой (fail closed).
+    """
     from m5.models.predict import make_submission, predict
 
     cfg = load_config(config)
-    preds = predict(cfg, as_of=as_of, model_stage=stage)
+    preds = predict(cfg, as_of=as_of, model_stage=stage, write_to_mart=not no_write)
     typer.echo(f"Прогнозов: {len(preds):,}")
     if submission:
         typer.echo(f"Submission: {make_submission(preds, cfg, submission)}")
 
 
+#: Код выхода, по которому Airflow помечает таск как skipped, а не failed.
+#: Это дефолт BashOperator.skip_on_exit_code.
+SKIP_EXIT_CODE = 99
+
+
+@model_app.command("gate")
+def model_gate(
+    config: ConfigOpt = "conf",
+    version: Annotated[int | None, typer.Option(help="Версия-кандидат")] = None,
+    metric: Annotated[str, typer.Option(help="По какой метрике сравнивать")] = "wmape",
+    min_improvement: Annotated[float, typer.Option()] = 0.01,
+) -> None:
+    """Гейт промоушена: решить, лучше ли кандидат прод-модели. Ничего не меняет.
+
+    Код выхода 0 — кандидат лучше, идём регистрировать.
+    Код выхода 99 — не лучше; Airflow помечает таск skipped, и ветка ниже
+    не выполняется. «Модель не стала лучше» — нормальный исход недели,
+    а не авария, поэтому не failed.
+    """
+    from m5.models.registry import compare_with_production
+
+    cfg = load_config(config)
+    better, reason, _ = compare_with_production(cfg, version, metric, min_improvement)
+    typer.echo(reason)
+
+    if not better:
+        raise typer.Exit(code=SKIP_EXIT_CODE)
+
+
 @model_app.command("promote")
 def model_promote(
     config: ConfigOpt = "conf",
-    version: Annotated[int, typer.Option(help="Версия-кандидат")] = ...,
+    version: Annotated[
+        int | None, typer.Option(help="Версия-кандидат. По умолчанию — последняя")
+    ] = None,
+    metric: Annotated[str, typer.Option(help="По какой метрике сравнивать")] = "wmape",
+    min_improvement: Annotated[
+        float, typer.Option(help="Минимальное относительное улучшение")
+    ] = 0.01,
 ) -> None:
-    """Промоутить версию в Production, если она лучше текущей."""
+    """Промоутить версию в Production, только если она лучше текущей прод-модели."""
     from m5.models.registry import promote_if_better
 
     cfg = load_config(config)
-    typer.echo(f"Промоутнули: {promote_if_better(cfg, version)}")
+    promoted = promote_if_better(cfg, version, metric=metric, min_improvement=min_improvement)
+    typer.echo("Промоутнули в Production" if promoted else "Прод-модель осталась прежней")
 
 
 # ---------------------------------------------------------------- monitor

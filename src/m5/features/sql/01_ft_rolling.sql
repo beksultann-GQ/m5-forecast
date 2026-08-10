@@ -52,7 +52,9 @@ SELECT
         AS trend_28_over_180
 
 FROM stg.sales_enriched
-WHERE date <= DATE '{{ as_of }}'
+-- Окна сдвинуты на горизонт (ROWS BETWEEN N PRECEDING AND 28 PRECEDING),
+-- поэтому на будущих датах в них попадает только факт, а не NULL'ы.
+WHERE date <= DATE '{{ ft_max_date }}'
 WINDOW w AS (PARTITION BY id ORDER BY date);
 
 
@@ -63,13 +65,13 @@ CREATE OR REPLACE TABLE ft.rolling_agg AS
 WITH dept_daily AS (
     SELECT store_id, dept_id, date, SUM(sales) AS dept_sales
     FROM stg.sales_enriched
-    WHERE date <= DATE '{{ as_of }}'
+    WHERE date <= DATE '{{ ft_max_date }}'
     GROUP BY 1, 2, 3
 ),
 cat_daily AS (
     SELECT store_id, cat_id, date, SUM(sales) AS cat_sales
     FROM stg.sales_enriched
-    WHERE date <= DATE '{{ as_of }}'
+    WHERE date <= DATE '{{ ft_max_date }}'
     GROUP BY 1, 2, 3
 )
 SELECT

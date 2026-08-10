@@ -99,12 +99,14 @@ def date_to_day_index(cfg: Config, target: date) -> int:
 
 
 def max_date(cfg: Config) -> date:
-    """Последняя дата с фактическими продажами. Дефолт для as_of."""
-    with connect(cfg.paths.duckdb_path, read_only=True) as con:
-        row = con.execute("SELECT MAX(date) FROM stg.sales_enriched").fetchone()
-    if not row or row[0] is None:
-        raise RuntimeError("stg.sales_enriched пуста — сначала `make staging`")
-    return row[0]
+    """Последняя дата с ФАКТИЧЕСКИМИ продажами. Дефолт для as_of.
+
+    Одна точка правды с data_bounds: без фильтра по sales сюда попадали бы
+    будущие дни календаря, и as_of молча уезжал бы на горизонт вперёд.
+    """
+    from m5.data.access import data_bounds
+
+    return data_bounds(cfg)[1]
 
 
 def export_staging_parquet(cfg: Config, out_dir: Path | None = None) -> Path:

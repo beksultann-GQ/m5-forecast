@@ -20,22 +20,34 @@ logger = get_logger(__name__)
 
 
 def data_bounds(cfg: Config) -> tuple[date, date]:
-    """Первая и последняя дата в staging-слое."""
+    """Первая и последняя дата, для которой есть ФАКТ продаж.
+
+    Фильтр `sales IS NOT NULL` обязателен: staging строит полную сетку по
+    календарю, а календарь в M5 длиннее продаж на горизонт. Без фильтра
+    «последней датой данных» оказались бы будущие дни с пустым таргетом,
+    и валидация нарезалась бы на них.
+    """
     with connect(cfg.paths.duckdb_path, read_only=True) as con:
-        row = con.execute("SELECT MIN(date), MAX(date) FROM stg.sales_enriched").fetchone()
+        row = con.execute(
+            "SELECT MIN(date), MAX(date) FROM stg.sales_enriched WHERE sales IS NOT NULL"
+        ).fetchone()
     if not row or row[0] is None:
         raise RuntimeError("stg.sales_enriched пуста — сначала `make staging`")
     return row[0], row[1]
 
 
 def load_sales(cfg: Config, start: date, end: date) -> pd.DataFrame:
-    """Продажи (id, date, sales) за окно. Для baseline'ов и оценки качества."""
+    """Факт продаж (id, date, sales) за окно. Для baseline'ов и оценки качества.
+
+    Строки без факта отбрасываем: они существуют в сетке (будущие даты),
+    но метрику по ним считать не с чем.
+    """
     with connect(cfg.paths.duckdb_path, read_only=True) as con:
         return con.execute(
             """
             SELECT id, date, CAST(sales AS DOUBLE) AS sales
             FROM stg.sales_enriched
-            WHERE date BETWEEN ? AND ?
+            WHERE date BETWEEN ? AND ? AND sales IS NOT NULL
             """,
             [start, end],
         ).df()

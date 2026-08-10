@@ -108,6 +108,36 @@ class TrainedModel:
         )
 
 
+class EmptyValidationError(RuntimeError):
+    """Валидационное окно пустое — обучаться вслепую нельзя."""
+
+
+def clamp_as_of(as_of: date | str | None, data_max: date) -> date:
+    """Ограничить as_of последней датой, для которой есть факт.
+
+    Зачем это нужно: Airflow подставляет в таск `--as-of {{ ds }}` — календарную
+    дату запуска. В реальном проде это правильно, но на историческом датасете
+    (M5 заканчивается 2016-06-19) `ds` уезжает в будущее. Тогда rolling origin
+    нарезает валидацию на датах, где данных нет, valid_df оказывается пустым,
+    early stopping не работает, а метрики не считаются — и всё это молча.
+
+    Поэтому обрезаем и громко предупреждаем.
+    """
+    if as_of is None:
+        return data_max
+
+    requested = date.fromisoformat(as_of) if isinstance(as_of, str) else as_of
+    if requested > data_max:
+        logger.warning(
+            "as_of=%s позже последней даты с фактом (%s) — обрезаю до неё. "
+            "Если это прод, значит данные не доехали.",
+            requested,
+            data_max,
+        )
+        return data_max
+    return requested
+
+
 # ---------------------------------------------------------------- подготовка фич
 
 
@@ -247,9 +277,8 @@ def train(
     from m5.evaluation.cv import make_folds
     from m5.models.baseline import score
 
-    data_start, data_end = data_bounds(cfg)
-    if as_of is not None:
-        data_end = date.fromisoformat(as_of) if isinstance(as_of, str) else as_of
+    data_start, data_max = data_bounds(cfg)
+    data_end = clamp_as_of(as_of, data_max)
 
     fold = make_folds(cfg, data_start, data_end)[0]
     logger.info("Обучение на фолде: %s", fold.describe())
@@ -262,8 +291,12 @@ def train(
     predictions: list[pd.DataFrame] = []
 
     for store_id in target_stores:
-        train_df = load_mart(cfg, fold.train_start, fold.train_end, store_id)
-        valid_df = load_mart(cfg, fold.val_start, fold.val_end, store_id)
+        # dropna по таргету: в витрине могут лежать строки будущих дат
+        # (их кладёт inference-режим), обучаться на них нечему
+        train_df = load_mart(cfg, fold.train_start, fold.train_end, store_id).dropna(
+            subset=["sales"]
+        )
+        valid_df = load_mart(cfg, fold.val_start, fold.val_end, store_id).dropna(subset=["sales"])
 
         if train_df.empty:
             logger.warning("store=%s: пустая обучающая выборка, пропускаю", store_id)
@@ -277,6 +310,16 @@ def train(
 
     if not models:
         raise RuntimeError("Не обучено ни одной модели — проверь, что ft.mart непустая")
+
+    if not predictions:
+        # Молчаливо обучиться без валидации — худший исход: early stopping
+        # не работает, метрик нет, а модель выглядит нормальной и едет дальше.
+        raise EmptyValidationError(
+            f"Валидационное окно [{fold.val_start}..{fold.val_end}] пустое — "
+            f"модель обучилась бы без early stopping и без метрик.\n"
+            f"Обычно это значит, что as_of указывает за пределы данных. "
+            f'Проверь `m5 db sql "SELECT MAX(date) FROM ft.mart"`.'
+        )
 
     metrics: dict[str, float] = {}
     if predictions:
@@ -390,28 +433,38 @@ def _save_ensemble(cfg: Config, models: dict[str, TrainedModel], metrics, fold) 
 
 
 def _log_to_mlflow(cfg: Config, models, metrics, fold, model_dir: Path) -> None:
-    """Залогировать прогон. Падение MLflow не должно ронять обучение."""
+    """Залогировать прогон и завести версию модели в Registry.
+
+    Падение MLflow не должно ронять обучение: модель уже сохранена локально,
+    терять её из-за недоступного трекинг-сервера бессмысленно.
+    """
     try:
         import mlflow
 
         from m5.config.loader import config_hash, flatten, git_sha
         from m5.data.download import dataset_version
+        from m5.models.registry import log_model_ensemble, save_run_id, setup_mlflow
 
-        mlflow.set_tracking_uri(str(cfg.mlflow.tracking_uri))
-        mlflow.set_experiment(str(cfg.mlflow.experiment_name))
+        setup_mlflow(cfg)
 
-        with mlflow.start_run(run_name=f"lgbm_tweedie_{fold.train_end}"):
+        with mlflow.start_run(run_name=f"lgbm_tweedie_{fold.train_end}") as run:
             mlflow.set_tags(
                 {
                     "git_sha": git_sha(),
                     "config_hash": config_hash(cfg),
                     "dataset_version": dataset_version(Path(cfg.paths.raw_dir)),
                     "fold": fold.describe(),
+                    "n_models": len(models),
                 }
             )
             mlflow.log_params({k: v for k, v in flatten(cfg).items() if v is not None})
             mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, int | float)})
-            mlflow.log_artifacts(str(model_dir), artifact_path="model")
+
+            # Ансамбль уезжает в Registry сразу в Staging. Промоушен в Production —
+            # отдельное решение по метрикам, см. registry.promote_if_better.
+            log_model_ensemble(cfg, model_dir, register=True)
+            save_run_id(model_dir, run.info.run_id)
+            logger.info("MLflow run %s залогирован, модель зарегистрирована", run.info.run_id)
     except Exception as exc:
         logger.warning(
             "MLflow недоступен (%s) — прогон не залогирован, модель сохранена локально", exc

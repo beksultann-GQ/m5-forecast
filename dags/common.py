@@ -68,10 +68,13 @@ def m5_command(
     Все таски должны быть ИДЕМПОТЕНТНЫ: повторный запуск с тем же {{ ds }}
     обязан давать тот же результат, а не задваивать данные. Это обеспечивается
     на уровне SQL (CREATE OR REPLACE, DELETE+INSERT по ключу), а не здесь.
+
+    Вызываем `m5`, а не `uv run m5`: в образе Airflow пакет ставится прямо
+    в системное окружение (см. docker/Dockerfile.airflow), никакого uv там нет.
     """
     return BashOperator(
         task_id=task_id,
-        bash_command=f"cd {PROJECT_DIR} && uv run m5 {command}",
+        bash_command=f"cd {PROJECT_DIR} && m5 {command}",
         on_failure_callback=alert_on_failure,
         dag=dag,
         pool=pool,

@@ -251,7 +251,7 @@ make raw staging validate features baseline train
 Сервисы:
 
 ```bash
-make up               # airflow (:8080) + mlflow (:5000) + postgres
+make up               # airflow (:8080) + mlflow (:5555) + postgres
 make api              # FastAPI на :8000
 make dashboard        # Streamlit на :8501
 ```
@@ -264,6 +264,29 @@ make fmt
 make test             # без сетевых и медленных
 make test-all
 ```
+
+---
+
+## Просмотр данных в DBeaver
+
+Путь к файлу: `make dbpath`. В DBeaver — **New Database Connection → DuckDB**,
+вставить путь в **Path**.
+
+**Обязательно** на вкладке *Driver properties* выставить `duckdb.read_only = true`.
+
+Причина: DuckDB — встраиваемая БД с блокировкой файла. Одновременно возможен
+**либо один процесс на запись, либо сколько угодно на чтение**. DBeaver,
+подключённый на запись, держит файл — и пайплайн падает с
+`Could not set lock on file`.
+
+| Команда | Режим | Уживается с DBeaver (read-only) |
+|---|---|---|
+| `make baseline`, `make train` | чтение | да |
+| `m5 db tables / peek / sql` | чтение | да |
+| `make staging`, `make features`, `make demo` | запись | нет, нужен Disconnect |
+
+Смотреть витрину во время обучения можно. Пересобирать её при подключённом
+DBeaver — нельзя.
 
 ---
 

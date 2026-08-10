@@ -16,16 +16,31 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # По умолчанию включён только session-бэкенд, и REST API отдаёт 403 на
+    # любой запрос из скрипта. Добавляем basic_auth: без него нельзя ни
+    # дёрнуть DAG извне, ни автоматизировать разбор инцидентов.
+    # Для локального окружения admin/admin достаточно; в реальном проде
+    # здесь был бы OAuth/LDAP, а не пароль в compose-файле.
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
     MLFLOW_TRACKING_URI: http://mlflow:5000
     M5_REPO_ROOT: /opt/m5
     M5_DUCKDB_PATH: /opt/m5/data/m5.duckdb
     KAGGLE_USERNAME: ${KAGGLE_USERNAME:-}
     KAGGLE_KEY: ${KAGGLE_KEY:-}
+    # git внутри контейнера видит .git смонтированным от другого пользователя
+    # и отказывается работать («dubious ownership»). Без этих трёх переменных
+    # git_sha в MLflow остаётся 'unknown', и связка «модель ↔ код» рвётся.
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: safe.directory
+    GIT_CONFIG_VALUE_0: /opt/m5
   volumes:
     - ../dags:/opt/airflow/dags
     - ../data:/opt/m5/data          # данные общие между Airflow и сервисами
     - ../conf:/opt/m5/conf
     - ../src:/opt/m5/src
+    # .git только на чтение: нужен, чтобы обучение внутри контейнера
+    # проставляло реальный git_sha прогона в MLflow
+    - ../.git:/opt/m5/.git:ro
     - airflow-logs:/opt/airflow/logs
   depends_on:
     postgres:
@@ -54,25 +69,51 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.mlflow
+    # --serve-artifacts обязателен, а не «для красоты»:
+    # без него artifact_location = путь ВНУТРИ контейнера (/mlartifacts/...),
+    # и клиент с хоста пытается писать туда же на своей файловой системе —
+    # каталога нет, загрузка модели падает. С этим флагом артефакты идут
+    # через API сервера, а он уже кладёт их в свой том.
     command: >
       mlflow server
       --host 0.0.0.0
       --port 5000
       --backend-store-uri postgresql://airflow:airflow@postgres:5432/mlflow
-      --default-artifact-root /mlartifacts
+      --serve-artifacts
+      --artifacts-destination /mlartifacts
     environment:
       MLFLOW_HTTP_REQUEST_TIMEOUT: "120"
+      # MLflow 3.x проверяет заголовок Host (защита от DNS rebinding) и по
+      # умолчанию пускает только localhost. Из контейнера Airflow запрос идёт
+      # на http://mlflow:5000, и сервер отвечает 403 «Invalid Host header».
+      # Перечисляем разрешённые хосты явно, а не ставим "*": внутри docker-сети
+      # это ровно два имени, и держать защиту включённой ничего не стоит.
+      # mlflow:5000 — обращение из контейнеров по docker-сети,
+      # localhost:5555 — с машины разработчика (порт наружу проброшен как 5555,
+      # потому что 5000 на macOS занят AirPlay Receiver).
+      MLFLOW_SERVER_ALLOWED_HOSTS: "mlflow,mlflow:5000,localhost,localhost:5000,localhost:5555,127.0.0.1,127.0.0.1:5000,127.0.0.1:5555"
     volumes:
       - mlflow-artifacts:/mlartifacts
     ports:
-      - "5000:5000"
+      # Снаружи 5555, а не 5000: на macOS порт 5000 занят AirPlay Receiver
+      # (ControlCenter, отвечает AirTunes и отдаёт 403). Внутри сети docker
+      # порт остаётся 5000 — Airflow ходит на http://mlflow:5000.
+      - "5555:5000"
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      # Через python, а не curl: в образе mlflow curl'а нет, и healthcheck
+      # на нём вечно красный при полностью живом сервисе.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"
       interval: 30s
+      timeout: 10s
       retries: 5
+      start_period: 30s
 
   # ---------------------------------------------------------------- Airflow
   airflow-init:
@@ -112,7 +153,12 @@ services:
       retries: 5
 
   # ---------------------------------------------------------------- сервисы
+  # api и dashboard вынесены в профиль `serving`: их код ещё не реализован
+  # (m5.serving.api:app = None), и при обычном `up` они бы бесконечно
+  # перезапускались, засоряя логи. Поднять отдельно:
+  #   docker compose --profile serving up -d
   api:
+    profiles: ["serving"]
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -128,6 +174,7 @@ services:
     restart: unless-stopped
 
   dashboard:
+    profiles: ["serving"]
     build:
       context: ..
       dockerfile: docker/Dockerfile

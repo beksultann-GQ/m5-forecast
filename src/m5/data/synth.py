@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from m5.config import Config
+from m5.data.download import write_manifest
 from m5.utils.logging import get_logger
 from m5.utils.paths import ensure_dir
 
@@ -70,11 +71,16 @@ def generate(
     """
     rng = np.random.default_rng(seed)
     raw_dir = ensure_dir(cfg.paths.raw_dir)
+    horizon = int(cfg.project.horizon)
 
-    calendar = _make_calendar(start_date, n_days)
+    # Календарь ДЛИННЕЕ продаж ровно на горизонт — как в настоящем M5, где
+    # sales_train_evaluation кончается на d_1941, а calendar.csv идёт до d_1969.
+    # Эти 28 дней и есть то, что прогнозируем: день недели, праздники, SNAP
+    # и цены на них уже известны, а продаж ещё нет.
+    calendar = _make_calendar(start_date, n_days + horizon)
     items = _make_items(n_items_per_dept)
     prices = _make_prices(items, calendar, rng)
-    sales = _make_sales(items, calendar, prices, rng)
+    sales = _make_sales(items, calendar.head(n_days), prices, rng)
 
     paths = {
         "calendar": raw_dir / "calendar.csv",
@@ -87,6 +93,11 @@ def generate(
     prices.to_csv(paths["sell_prices"], index=False)
     sales.to_csv(paths["sales_train_evaluation"], index=False)
     _make_submission(sales).to_csv(paths["sample_submission"], index=False)
+
+    # Манифест нужен и для синтетики: dataset_version уезжает тегом в MLflow,
+    # и «на каких данных обучена эта модель» должно иметь ответ всегда,
+    # а не только когда данные пришли с Kaggle.
+    write_manifest(raw_dir)
 
     logger.info(
         "Синтетика готова: %d рядов × %d дней = %s строк после разворота",

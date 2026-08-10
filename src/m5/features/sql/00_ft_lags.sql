@@ -30,5 +30,8 @@ SELECT
         AS sales_same_dow_mean_3w
 
 FROM stg.sales_enriched
-WHERE date <= DATE '{{ as_of }}'
+-- ft_max_date = as_of на обучении и as_of + horizon на инференсе.
+-- Во втором случае в окно попадают будущие даты с sales = NULL, и LAG для них
+-- берёт историю: для дня as_of + h лаг 28 указывает на as_of + h - 28 <= as_of.
+WHERE date <= DATE '{{ ft_max_date }}'
 WINDOW w AS (PARTITION BY id ORDER BY date);

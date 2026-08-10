@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from m5.config import Config
@@ -57,14 +57,31 @@ def build_features(
     """
     from m5.data.staging import max_date
 
+    if mode not in ("train", "inference"):
+        raise ValueError(f"mode должен быть 'train' или 'inference', получено {mode!r}")
+
     as_of = _resolve_as_of(cfg, as_of, max_date)
+    horizon = int(cfg.project.horizon)
+
+    # Единственное, чем отличаются train и inference: до какой даты тянем витрину.
+    # На инференсе добавляем горизонт — это те самые будущие строки с sales = NULL,
+    # по которым будет предсказание. SQL при этом один и тот же.
+    ft_max_date = as_of if mode == "train" else as_of + timedelta(days=horizon)
+
     params = {
         "as_of": as_of.isoformat(),
-        "horizon": int(cfg.project.horizon),
+        "ft_max_date": ft_max_date.isoformat(),
+        "horizon": horizon,
         "external_dir": str(resolve(cfg.paths.external_dir)),
         "store_filter": _store_filter(stores),
     }
-    logger.info("Сборка фич: mode=%s as_of=%s stores=%s", mode, as_of, stores or "все")
+    logger.info(
+        "Сборка фич: mode=%s as_of=%s ft_max_date=%s stores=%s",
+        mode,
+        as_of,
+        ft_max_date,
+        stores or "все",
+    )
 
     sql_files = _sql_plan(cfg)
     stats: dict[str, int] = {}

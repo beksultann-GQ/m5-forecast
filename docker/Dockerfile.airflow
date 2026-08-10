@@ -16,10 +16,13 @@ USER airflow
 
 ENV M5_REPO_ROOT=/opt/m5
 
-COPY --chown=airflow:root pyproject.toml /opt/m5/
+# README.md обязателен: в pyproject.toml стоит readme = "README.md",
+# и hatchling падает на генерации метаданных, если файла нет в контексте сборки.
+COPY --chown=airflow:root pyproject.toml README.md /opt/m5/
 COPY --chown=airflow:root src/ /opt/m5/src/
 COPY --chown=airflow:root conf/ /opt/m5/conf/
 
 # Ставим проект в окружение Airflow, а не в отдельный venv:
-# так DAG'и могут импортировать m5 напрямую, а BashOperator видит CLI.
+# так DAG'и импортируют m5 напрямую, а BashOperator видит CLI `m5` в PATH.
+# Editable-режим + бинд-маунт src/ в compose = правка кода без пересборки образа.
 RUN pip install --no-cache-dir -e "/opt/m5[monitoring]"

@@ -95,8 +95,8 @@ logs:  ## Логи docker compose
 	docker compose -f docker/docker-compose.yml logs -f
 
 .PHONY: mlflow
-mlflow:  ## Локальный MLflow UI (без докера)
-	$(UV) mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
+mlflow:  ## Локальный MLflow UI без докера (порт 5555: 5000 занят AirPlay на macOS)
+	$(UV) mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5555
 
 .PHONY: api
 api:  ## FastAPI-сервис прогнозов

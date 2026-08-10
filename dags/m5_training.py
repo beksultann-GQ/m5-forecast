@@ -10,13 +10,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.empty import EmptyOperator
-from airflow.operators.python import ShortCircuitOperator
 from airflow.utils.task_group import TaskGroup
-from common import DEFAULT_ARGS, alert_on_failure, alert_on_sla_miss, m5_command
+from common import DEFAULT_ARGS, alert_on_sla_miss, m5_command
 
 DAG_ID = "m5_training"
 
@@ -51,9 +50,25 @@ with DAG(
     # Погода и праздники тянутся параллельно: они независимы.
     # Падение внешнего API не должно ронять обучение целиком —
     # trigger_rule ниже позволяет продолжить на закешированных данных.
+    # retries=0 здесь осознанно, хотя обычно у сетевых задач ретраи нужны.
+    # Причина: внутри ЭТОГО DAG'а внешние данные опциональны — ниже стоит
+    # trigger_rule="all_done", и обучение пойдёт даже без них. При retries=3
+    # с экспоненциальной паузой (5 → 10 → 20 мин) необязательный шаг держал бы
+    # весь пайплайн заложником на полчаса.
+    # Настоящие ретраи живут в m5_external_ingest, где загрузка — самоцель.
     with TaskGroup("external") as external:
-        weather = m5_command("weather", "external weather --mode archive")
-        holidays = m5_command("holidays", "external holidays")
+        weather = m5_command(
+            "weather",
+            "external weather --mode archive",
+            retries=0,
+            execution_timeout=timedelta(minutes=20),
+        )
+        holidays = m5_command(
+            "holidays",
+            "external holidays",
+            retries=0,
+            execution_timeout=timedelta(minutes=10),
+        )
 
     # ------------------------------------------------------------ фичи и обучение
     build_features = m5_command(
@@ -62,6 +77,11 @@ with DAG(
         trigger_rule="all_done",  # внешние данные опциональны, ядро пайплайна — нет
     )
 
+    # {{ ds }} — календарная дата запуска. В реальном проде это и есть граница
+    # знания. На историческом датасете (M5 кончается 2016-06-19) ds уезжает
+    # в будущее, поэтому m5.models.train.clamp_as_of обрезает его до последней
+    # даты с фактом и громко предупреждает. Без обрезки валидационное окно
+    # оказывается пустым, а обучение — молча без early stopping и без метрик.
     train = m5_command(
         "train",
         "model train --as-of {{ ds }}",
@@ -72,31 +92,36 @@ with DAG(
     backtest = m5_command("backtest", "model backtest")
 
     # ------------------------------------------------------------ гейт и регистрация
-    def _beats_production(**context) -> bool:
-        """Сравнить кандидата с прод-моделью.
-
-        Returns:
-            True -> идём регистрировать, False -> DAG корректно останавливается.
-
-        TODO:
-            1. взять метрики последнего backtest-run из MLflow
-            2. взять метрики текущей Production-версии
-            3. вернуть candidate_wrmsse < prod_wrmsse * (1 - min_improvement)
-            4. записать решение и причину в XCom — чтобы было видно в UI
-        """
-        raise NotImplementedError
-
-    is_better = ShortCircuitOperator(
-        task_id="is_better_than_production",
-        python_callable=_beats_production,
-        on_failure_callback=alert_on_failure,
+    #
+    # Гейт — обычный BashOperator, а не ShortCircuitOperator с python_callable.
+    # Это не стилистика, а необходимость: PythonOperator исполняется в процессе,
+    # который Airflow форкает от многопоточного воркера. Импорт mlflow и LightGBM
+    # в таком форке на Linux валит процесс молча, без питоновского traceback —
+    # в логе остаётся только «exited with return code 1», и искать причину
+    # приходится часами.
+    #
+    # Заодно это возвращает нас к принципу проекта: DAG вызывает те же команды
+    # `m5`, что и человек в терминале. Никакой отдельной логики в DAG'е нет.
+    #
+    # skip_on_exit_code=99: `m5 model gate` выходит с этим кодом, когда кандидат
+    # не лучше прод-модели. Таск помечается skipped, ветка ниже не выполняется,
+    # DAG завершается зелёным. «Модель не стала лучше» — нормальный исход недели.
+    is_better = m5_command(
+        "is_better_than_production",
+        "model gate --metric wmape",
+        skip_on_exit_code=99,
+        retries=0,  # сравнение детерминировано, ретраить нечего
     )
 
-    register = m5_command(
-        "register_model", "model promote --version {{ ti.xcom_pull(key='version') }}"
-    )
+    # promote перепроверяет условие сам — это делает таск идемпотентным:
+    # повторный запуск при ретрае не промоутит модель второй раз вслепую.
+    register = m5_command("register_model", "model promote")
 
-    end = EmptyOperator(task_id="end", trigger_rule="none_failed_min_one_success")
+    # none_failed, а не none_failed_min_one_success: когда гейт решил не
+    # промоутить, register_model становится skipped, и требование «хотя бы один
+    # успешный апстрим» не выполнялось бы. Но «модель не стала лучше» — штатный
+    # исход, и терминальный узел обязан отработать.
+    end = EmptyOperator(task_id="end", trigger_rule="none_failed")
 
     start >> ingest >> validate >> external >> build_features
     build_features >> train >> backtest >> is_better >> register >> end

@@ -1,22 +1,46 @@
 -- Staging: продажи + иерархия + календарь + цены в одной таблице.
 -- Это вход для ft-слоя. Здесь ещё НЕТ лагов и окон — только «сырые» атрибуты дня.
 --
+-- ГЛАВНОЕ АРХИТЕКТУРНОЕ РЕШЕНИЕ ЭТОГО ФАЙЛА
+--   Строим не «продажи, обогащённые атрибутами», а ПОЛНУЮ СЕТКУ (ряд × день)
+--   по календарю, и уже к ней подтягиваем продажи через LEFT JOIN.
+--
+--   Зачем: календарь в M5 длиннее продаж ровно на горизонт (d_1..d_1969 против
+--   d_1..d_1941). Значит будущие 28 дней попадают в таблицу со всеми известными
+--   атрибутами — день недели, праздники, SNAP, цена — но с sales = NULL.
+--
+--   Благодаря этому инференс считается ТЕМ ЖЕ SQL, что и обучение: лаги и окна
+--   для будущей даты T берут историю (T-28 и раньше), которая уже есть в этой же
+--   таблице. Никакого отдельного «скрипта для прода» не нужно, а значит неоткуда
+--   взяться training/serving skew.
+--
 -- Две обрезки:
---   1. keep_last_days   — не тащим всю историю с 2011, если она не нужна
---   2. first_sale_date  — выкидываем нули до появления товара в ассортименте
+--   1. history_start_date — не тащим всю историю с 2011, если она не нужна
+--   2. first_sale_date    — выкидываем нули до появления товара в ассортименте
 
 CREATE SCHEMA IF NOT EXISTS stg;
 
 CREATE OR REPLACE TABLE stg.sales_enriched AS
+WITH grid AS (
+    -- полная сетка: каждый ряд × каждый день календаря
+    SELECT h.id, c.date, c.day_index
+    FROM stg.hierarchy h
+    CROSS JOIN (
+        SELECT date, day_index FROM stg.calendar
+        WHERE date >= DATE '{{ history_start_date }}'
+    ) c
+)
 SELECT
-    s.id,
+    g.id,
     h.item_id,
     h.dept_id,
     h.cat_id,
     h.store_id,
     h.state_id,
-    s.date,
-    s.day_index,
+    g.date,
+    g.day_index,
+
+    -- NULL на будущих датах: факта ещё нет, и это не ноль продаж
     s.sales,
 
     -- календарь
@@ -57,14 +81,15 @@ SELECT
 
     -- «товар уже в ассортименте»
     fs.first_sale_date,
-    DATEDIFF('day', fs.first_sale_date, s.date) AS days_since_first_sale,
+    DATEDIFF('day', fs.first_sale_date, g.date) AS days_since_first_sale,
     CASE WHEN p.sell_price IS NULL THEN 1 ELSE 0 END AS is_out_of_assortment
 
-FROM stg.sales_long s
+FROM grid g
 JOIN stg.hierarchy h        USING (id)
-JOIN stg.calendar  c        USING (date)
-LEFT JOIN stg.calendar_events ce USING (date)
-LEFT JOIN stg.snap sn       ON sn.date = s.date AND sn.state_id = h.state_id
+JOIN stg.calendar  c        ON c.date = g.date
+LEFT JOIN stg.sales_long s  ON s.id = g.id AND s.date = g.date
+LEFT JOIN stg.calendar_events ce ON ce.date = g.date
+LEFT JOIN stg.snap sn       ON sn.date = g.date AND sn.state_id = h.state_id
 LEFT JOIN stg.prices p      ON p.store_id = h.store_id
                            AND p.item_id  = h.item_id
                            AND p.wm_yr_wk = c.wm_yr_wk
@@ -74,7 +99,6 @@ LEFT JOIN stg.prices_relative pr ON pr.store_id = h.store_id
 LEFT JOIN stg.first_sale fs USING (id)
 
 WHERE
-    -- граница считается из data.keep_last_days; null в конфиге = вся история
-    s.date >= DATE '{{ history_start_date }}'
-    -- нули до первой продажи в обучение не идут
-    AND (fs.first_sale_date IS NULL OR s.date >= fs.first_sale_date);
+    -- нули до первой продажи в обучение не идут: это отсутствие товара
+    -- в ассортименте, а не нулевой спрос
+    fs.first_sale_date IS NULL OR g.date >= fs.first_sale_date;
