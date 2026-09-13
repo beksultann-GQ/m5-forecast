@@ -1,382 +1,384 @@
-# M5 Forecast — прогноз дневных продаж
+**English** · [Қазақша](README.kk.md) · [Русский](README.ru.md)
 
-Production-ready пайплайн прогнозирования спроса на данных [M5 Forecasting Accuracy](https://www.kaggle.com/competitions/m5-forecasting-accuracy).
+# M5 Forecast — daily sales forecasting
 
-> **Статус: работающая тонкая вертикаль.**
-> Слой данных, витрина фич, baseline'ы и обучение LightGBM реализованы и проверены.
-> `make demo` собирает всё на синтетике за ~20 секунд, без Kaggle-аккаунта.
-> Инференс в витрину, WRMSSE, MLflow Registry, Airflow-таски и внешние данные —
-> ещё скелет с `TODO`. Что дальше — в разделе [Порядок работ](#порядок-работ).
+A production-ready demand forecasting pipeline on the [M5 Forecasting Accuracy](https://www.kaggle.com/competitions/m5-forecasting-accuracy) data.
+
+> **Status: a working thin vertical slice.**
+> The data layer, feature mart, baselines and LightGBM training are implemented and verified.
+> `make demo` builds everything on synthetic data in ~20 seconds, no Kaggle account needed.
+> Inference into the mart, WRMSSE, MLflow Registry, Airflow tasks and external data
+> are still skeletons with `TODO`s. What comes next is in the [Roadmap](#roadmap).
 
 ---
 
-## Постановка задачи
+## Problem statement
 
-Это не соревнование, а продуктовая задача. Формулировка зафиксирована **до** написания кода.
+This is not a competition entry but a product task. The formulation was fixed **before** any code was written.
 
-**Что прогнозируем.** Дневные продажи в штуках по паре (товар, магазин). Горизонт — 28 дней.
-30 490 рядов: 3 049 товаров × 10 магазинов в 3 штатах США (CA, TX, WI).
+**What we forecast.** Daily unit sales per (item, store) pair. Horizon — 28 days.
+30,490 series: 3,049 items × 10 stores in 3 US states (CA, TX, WI).
 
-**Кто потребитель.** Условный отдел закупок. Ему нужен батч-прогноз раз в неделю
-под цикл заказа поставщику, а не realtime API. Отсюда все архитектурные решения:
-батч-инференс в витрину, FastAPI отдаёт готовое, модель на лету ничего не считает.
+**Who the consumer is.** A hypothetical purchasing department. It needs a batch forecast once a week
+to fit the supplier ordering cycle, not a realtime API. Every architectural decision follows from that:
+batch inference into a mart, FastAPI serves precomputed results, the model computes nothing on the fly.
 
-**Метрики.**
+**Metrics.**
 
-| Метрика | Роль |
+| Metric | Role |
 |---|---|
-| **WRMSSE** | Метрика соревнования. Взвешенная по 12 уровням агрегации. Нужна, чтобы сверяться с публичным лидербордом и понимать, где мы в мире. |
-| **WMAPE** | Бизнес-метрика. «Мы ошибаемся на 23% объёма» — это понятно закупщику. MAPE неприменим: ~68% значений нулевые. |
-| **Bias** | Систематический недо-/перепрогноз. Недопрогноз = упущенные продажи, перепрогноз = замороженные деньги и списания. Знак важнее модуля. |
+| **WRMSSE** | The competition metric. Weighted across 12 aggregation levels. Needed to compare against the public leaderboard and understand where we stand globally. |
+| **WMAPE** | The business metric. "We are off by 23% of volume" — a buyer understands that. MAPE is not applicable: ~68% of values are zero. |
+| **Bias** | Systematic under-/over-forecasting. Under-forecast = lost sales, over-forecast = frozen cash and write-offs. The sign matters more than the magnitude. |
 
-**Baseline, который надо побить.** `seasonal_naive`: продажи = ровно 28 дней назад.
-Плюс `dow_mean` (среднее по дню недели за 8 недель) как более честная планка.
+**The baseline to beat.** `seasonal_naive`: sales = exactly 28 days ago.
+Plus `dow_mean` (mean by day of week over 8 weeks) as a more honest bar.
 
-Без baseline любой ML — карго-культ. Число, полученное здесь, — планка на весь проект.
-
----
-
-## Архитектурные решения и почему они такие
-
-**Feature engineering на SQL (DuckDB), Python — клей.**
-После разворота в long-формат это ~59 млн строк. `pd.melt` на таком датасете не работает
-на ноутбуке в принципе. DuckDB делает `UNPIVOT` + оконные функции out-of-core.
-Заодно это ближе к тому, как фичи считаются в реальном DWH.
-
-**Одна функция считает фичи для train и для inference.**
-Не два скрипта. Разница только в параметре `as_of`. Иначе получается
-training/serving skew — классический прод-баг, когда на валидации всё прекрасно,
-а в проде мусор, потому что в inference-скрипте кто-то посчитал rolling mean чуть иначе.
-
-**Все лаги и окна сдвинуты минимум на 28 дней.**
-Горизонт прогноза — 28 дней. Значит, в момент прогноза продажи за последние 28 дней
-ещё неизвестны. `lag_7` физически невозможно посчитать в проде, а на валидации
-он даст великолепный скор. Это ошибка №1 в прогнозировании рядов, и она молчаливая.
-
-**Direct, а не recursive.** Recursive (предсказали день 1, подставили в фичи,
-предсказали день 2) к 28-му дню строит прогноз почти целиком на собственных
-предсказаниях и накапливает ошибку. Здесь каждый день горизонта предсказывается
-напрямую из фич, известных на момент прогноза.
-
-Важная оговорка, которую стоит проговаривать вслух: **группы горизонтов
-(1-7, 8-14, ...) при текущем наборе фич бессмысленны.** Раз все лаги >= 28
-и считаются относительно даты строки, один вектор фич валиден для всего горизонта —
-четыре модели обучились бы на идентичных данных. Direct multi-step окупается,
-когда у ближних горизонтов фичи свежее: для h=1..7 законно брать `lag_7`.
-Это требует параметризовать минимальный лаг в SQL и собирать четыре витрины —
-следующий шаг, а не то, что уже сделано.
-
-**LightGBM с objective=tweedie.**
-~68% таргета — нули. Tweedie — смесь Пуассона (сколько покупок) и гаммы (размер покупки),
-ровно структура прерывистого розничного спроса. На M5 стабильно бьёт RMSE.
-
-**10 моделей по магазинам.**
-Меньше пик памяти (влезает в MacBook), плюс модель ловит специфику магазина.
-Итого ансамбль 10 × 4 = 40 небольших моделей.
-
-**Нейросети не трогаем.** Пока не работает весь пайплайн, N-BEATS и подобное
-не добавят ценности проекту, а времени съедят месяц.
+Without a baseline any ML is cargo cult. The number obtained here is the bar for the whole project.
 
 ---
 
-## Дополнительные источники данных
+## Architectural decisions and why
 
-Сверх Kaggle-датасета подключены два внешних API. Оба бесплатные, без ключа.
+**Feature engineering in SQL (DuckDB), Python is the glue.**
+After unpivoting to long format this is ~59M rows. `pd.melt` on such a dataset simply does not work
+on a laptop. DuckDB does `UNPIVOT` + window functions out-of-core.
+It is also closer to how features are computed in a real DWH.
 
-### Погода — Open-Meteo (запасной вариант: Visual Crossing)
+**One function computes features for both train and inference.**
+Not two scripts. The only difference is the `as_of` parameter. Otherwise you get
+training/serving skew — the classic production bug where validation looks great
+and production is garbage because someone computed the rolling mean slightly differently in the inference script.
 
-**Гипотеза.** Погода двигает продажи: жара → напитки и мороженое, снегопад → провал
-трафика в магазин, резкое похолодание → закупка впрок. Для FOODS (крупнейшая
-категория M5) эффект должен быть заметен.
+**All lags and windows are shifted by at least 28 days.**
+The forecast horizon is 28 days. So at forecast time the last 28 days of sales
+are not yet known. `lag_7` is physically impossible to compute in production, yet on validation
+it gives a superb score. This is mistake #1 in time series forecasting, and it is silent.
 
-**Что берём.** Дневные агрегаты по одной репрезентативной точке на штат
-(LA / Даллас / Мэдисон). Точных адресов магазинов Walmart не публикует —
-это осознанное упрощение, и его надо проговаривать, а не прятать.
+**Direct, not recursive.** Recursive (predict day 1, plug it into the features,
+predict day 2) by day 28 builds the forecast almost entirely on its own
+predictions and accumulates error. Here every day of the horizon is predicted
+directly from features known at forecast time.
 
-**Производные фичи.** Сырая температура — слабый признак. Работает **отклонение от нормы**:
-+25 °C в январе в Висконсине и +25 °C в июле в Калифорнии значат совершенно разное.
-Считаем `temp_anomaly`, градусо-дни `hdd`/`cdd`, флаги `is_heavy_rain` / `is_snow_day`,
-перепад `temp_change_1d`.
+An important caveat worth saying out loud: **horizon groups
+(1-7, 8-14, ...) are meaningless with the current feature set.** Since all lags are >= 28
+and computed relative to the row date, one feature vector is valid for the whole horizon —
+four models would train on identical data. Direct multi-step pays off
+when near horizons get fresher features: for h=1..7 `lag_7` is legitimate.
+That requires parameterising the minimum lag in SQL and building four marts —
+the next step, not something already done.
 
-**Главная ловушка — training/serving skew.**
-На обучении погода известна фактическая. На инференсе за горизонт 28 дней —
-не известна и известна быть не может. Стратегия:
+**LightGBM with objective=tweedie.**
+~68% of the target is zeros. Tweedie is a mixture of Poisson (how many purchases) and gamma (purchase size),
+exactly the structure of intermittent retail demand. On M5 it consistently beats RMSE.
+
+**10 models, one per store.**
+Lower peak memory (fits on a MacBook), plus the model captures store specifics.
+In total an ensemble of 10 × 4 = 40 small models.
+
+**No neural networks.** Until the whole pipeline works, N-BEATS and the like
+add no value to the project and would eat a month.
+
+---
+
+## Additional data sources
+
+On top of the Kaggle dataset two external APIs are wired in. Both free, no key required.
+
+### Weather — Open-Meteo (fallback: Visual Crossing)
+
+**Hypothesis.** Weather moves sales: heat → drinks and ice cream, snowfall → a dip
+in store traffic, a sharp cold snap → stocking up. For FOODS (the largest
+M5 category) the effect should be noticeable.
+
+**What we take.** Daily aggregates for one representative point per state
+(LA / Dallas / Madison). Walmart does not publish exact store addresses —
+this is a deliberate simplification, and it should be stated, not hidden.
+
+**Derived features.** Raw temperature is a weak signal. What works is **deviation from the norm**:
++25 °C in January in Wisconsin and +25 °C in July in California mean completely different things.
+We compute `temp_anomaly`, degree-days `hdd`/`cdd`, flags `is_heavy_rain` / `is_snow_day`,
+the swing `temp_change_1d`.
+
+**The main trap — training/serving skew.**
+In training the actual weather is known. At inference, over a 28-day horizon,
+it is not known and cannot be. Strategy:
 
 ```
-дни 1–16  →  прогноз Open-Meteo Forecast API
-дни 17–28 →  климатическая норма по дню года
+days 1–16  →  Open-Meteo Forecast API
+days 17–28 →  climatological norm by day of year
 ```
 
-Колонка `weather_source` (`archive` / `forecast` / `climatology`) доезжает до витрины
-и отдельно мониторится. Если доля `climatology` подскочила — внешний API отвалился,
-и качество на дальнем горизонте просядет ещё до того, как приедет факт.
+The `weather_source` column (`archive` / `forecast` / `climatology`) travels all the way to the mart
+and is monitored separately. If the share of `climatology` jumps — the external API is down,
+and quality on the far horizon will degrade before the actuals arrive.
 
-Честный вариант — обучаться сразу на «прогнозной» погоде, но исторических прогнозов
-у нас нет. Это записанное ограничение, а не забытая деталь.
+The honest option is to train directly on "forecast" weather, but we have no historical forecasts.
+This is a recorded limitation, not a forgotten detail.
 
-### Госпраздники — Nager.Date
+### Public holidays — Nager.Date
 
-**Зачем, если в `calendar.csv` уже есть `event_name_1/2`:**
+**Why, when `calendar.csv` already has `event_name_1/2`:**
 
-1. События M5 — плоский список без региональности. Cesar Chavez Day — выходной
-   в Калифорнии и обычный рабочий день в Техасе. Nager отдаёт праздники
-   по субдивизиям (`US-CA`, `US-TX`, `US-WI`).
-2. Nager различает типы: Public / Bank / School / Optional — эффект на трафик разный.
-3. Независимый источник: можно сверить и найти дыры в M5-событиях
-   (команда `m5 external compare-events`).
-4. **Никакого skew.** В отличие от погоды, календарь праздников известен на годы вперёд
-   и одинаково доступен на train и в проде. Это «бесплатная» фича.
+1. M5 events are a flat list with no regionality. Cesar Chavez Day is a holiday
+   in California and an ordinary working day in Texas. Nager returns holidays
+   by subdivision (`US-CA`, `US-TX`, `US-WI`).
+2. Nager distinguishes types: Public / Bank / School / Optional — the effect on traffic differs.
+3. An independent source: it can be cross-checked to find gaps in M5 events
+   (the `m5 external compare-events` command).
+4. **No skew.** Unlike weather, the holiday calendar is known years ahead
+   and equally available in train and in production. It is a "free" feature.
 
-**Производные фичи.** Сам день праздника — слабый сигнал: магазин полупустой или закрыт.
-Работает окрестность — закупаются **накануне**. Считаем `is_day_before_holiday`,
+**Derived features.** The holiday itself is a weak signal: the store is half-empty or closed.
+What works is the neighbourhood — people stock up **the day before**. We compute `is_day_before_holiday`,
 `is_day_after_holiday`, `days_to_next_holiday`, `is_long_weekend`.
 
-### Проверка, что это вообще помогло
+### Checking that it actually helped
 
-Внешние данные не добавляются «для солидности». В проекте предусмотрен ablation:
+External data is not added "for solidity". The project includes an ablation:
 
 ```bash
-make backtest                       # база
-m5 model backtest --ablation        # база / +погода / +праздники / всё
+make backtest                       # base
+m5 model backtest --ablation        # base / +weather / +holidays / all
 ```
 
-Сравнение идёт на одних и тех же фолдах. Если прирост нулевой — источник убирается.
-Результат этой таблицы должен лежать в README: это ответ на вопрос
-«а зачем ты вообще брал внешние данные».
+The comparison runs on the same folds. If the gain is zero — the source is removed.
+The result of that table should live in the README: it is the answer to the question
+"why did you take external data at all".
 
 ---
 
-## Валидация
+## Validation
 
-Никакого random split. Только **rolling origin** по времени.
+No random split. Only **rolling origin** in time.
 
 ```
 |-------------- train --------------|--- gap 28 ---|--- val 28 ---|
                                    T                              T+56
 ```
 
-**Gap в 28 дней обязателен.** Без него скользящие статистики, посчитанные
-на границе train, захватывают дни из val. С `gap = horizon` такой возможности
-нет по построению.
+**The 28-day gap is mandatory.** Without it, rolling statistics computed
+at the train boundary capture days from val. With `gap = horizon` that is
+impossible by construction.
 
-4 фолда «лесенкой» назад от последней даты, расширяющееся обучающее окно
-(старая история несёт годовую сезонность — выкидывать её не надо).
+4 folds stepping back from the last date, an expanding training window
+(old history carries yearly seasonality — no need to throw it away).
 
-На это написаны тесты: [tests/test_leakage.py](tests/test_leakage.py). Ключевой —
-`test_feature_value_stable_when_future_changes`: меняем продажи после `as_of`
-и проверяем, что фичи до `as_of` не изменились байт-в-байт. Если изменились —
-какая-то фича смотрит в будущее, и не важно какая.
+Tests cover this: [tests/test_leakage.py](tests/test_leakage.py). The key one is
+`test_feature_value_stable_when_future_changes`: we change sales after `as_of`
+and check that features before `as_of` are byte-for-byte unchanged. If they changed —
+some feature looks into the future, and it does not matter which.
 
 ---
 
-## Стек
+## Stack
 
-| Слой | Технология |
+| Layer | Technology |
 |---|---|
-| Загрузка данных | Kaggle CLI → Parquet |
-| Хранилище / трансформации | DuckDB (слои `raw` → `stg` → `ft` → `mart`) |
-| Валидация данных | pandera + SQL-инварианты |
-| Фичи | SQL (оконные функции DuckDB) |
-| Внешние данные | Open-Meteo, Nager.Date (httpx + файловый кеш) |
-| Модель | LightGBM, objective=tweedie |
-| Эксперименты | MLflow + Model Registry |
-| Оркестрация | Airflow (3 DAG'а) |
-| Мониторинг | Evidently + Streamlit |
+| Data loading | Kaggle CLI → Parquet |
+| Storage / transformations | DuckDB (layers `raw` → `stg` → `ft` → `mart`) |
+| Data validation | pandera + SQL invariants |
+| Features | SQL (DuckDB window functions) |
+| External data | Open-Meteo, Nager.Date (httpx + file cache) |
+| Model | LightGBM, objective=tweedie |
+| Experiments | MLflow + Model Registry |
+| Orchestration | Airflow (3 DAGs) |
+| Monitoring | Evidently + Streamlit |
 | CI/CD | pytest, ruff, GitHub Actions |
-| Упаковка | Docker, Docker Compose |
-| API | FastAPI (опционально) |
+| Packaging | Docker, Docker Compose |
+| API | FastAPI (optional) |
 
 ---
 
-## Структура
+## Layout
 
 ```
 .
-├── conf/                  # yaml-конфиги, ничего не хардкодим в коде
-│   ├── config.yaml        #   корневой + defaults
-│   ├── data.yaml          #   файлы, слои, обрезки
-│   ├── features.yaml      #   лаги, окна, календарь, цены
-│   ├── model.yaml         #   LightGBM, группы горизонтов
-│   ├── validation.yaml    #   rolling origin, метрики
-│   └── external.yaml      #   погода и праздники
+├── conf/                  # yaml configs, nothing hard-coded in code
+│   ├── config.yaml        #   root + defaults
+│   ├── data.yaml          #   files, layers, cut-offs
+│   ├── features.yaml      #   lags, windows, calendar, prices
+│   ├── model.yaml         #   LightGBM, horizon groups
+│   ├── validation.yaml    #   rolling origin, metrics
+│   └── external.yaml      #   weather and holidays
 ├── src/m5/
-│   ├── cli.py             # единая точка входа: и человек, и Airflow дёргают её
-│   ├── config/            # загрузка конфигов
-│   ├── data/              # download, csv→parquet, staging, схемы
-│   │   └── sql/           #   staging-слой: UNPIVOT, календарь, цены
-│   ├── external/          # Open-Meteo, Nager.Date, кеширующий HTTP-клиент
-│   ├── features/          # сборка витрины фич
-│   │   └── sql/           #   лаги, окна, погода, праздники, витрина
+│   ├── cli.py             # single entry point: both humans and Airflow call it
+│   ├── config/            # config loading
+│   ├── data/              # download, csv→parquet, staging, schemas
+│   │   └── sql/           #   staging layer: UNPIVOT, calendar, prices
+│   ├── external/          # Open-Meteo, Nager.Date, caching HTTP client
+│   ├── features/          # feature mart build
+│   │   └── sql/           #   lags, windows, weather, holidays, mart
 │   ├── models/            # baseline, train, predict, MLflow registry
-│   ├── evaluation/        # WRMSSE, rolling origin CV, бэктест
-│   ├── monitoring/        # дрифт, фактическое качество
-│   └── serving/           # FastAPI поверх витрины
+│   ├── evaluation/        # WRMSSE, rolling origin CV, backtest
+│   ├── monitoring/        # drift, actual quality
+│   └── serving/           # FastAPI on top of the mart
 ├── dags/                  # m5_training, m5_inference, m5_external_ingest
 ├── tests/
 ├── dashboards/            # Streamlit
 ├── docker/
-└── notebooks/             # только EDA и черновики
+└── notebooks/             # EDA and drafts only
 ```
 
 ---
 
-## Быстрый старт
+## Quick start
 
 ```bash
-make setup            # uv + venv + зависимости + pre-commit
-brew install libomp   # macOS: OpenMP-рантайм, без него LightGBM не импортируется
+make setup            # uv + venv + dependencies + pre-commit
+brew install libomp   # macOS: OpenMP runtime, LightGBM does not import without it
 ```
 
-**Без Kaggle-аккаунта** — синтетический датасет той же формы:
+**Without a Kaggle account** — a synthetic dataset of the same shape:
 
 ```bash
-make demo             # synth -> parquet -> staging -> витрина фич -> список таблиц
-make baseline         # планка, которую надо побить
-make train            # обучить LightGBM + показать важность фич
-make tables           # что лежит в DuckDB
-make dbpath           # путь к файлу для DBeaver
+make demo             # synth -> parquet -> staging -> feature mart -> table list
+make baseline         # the bar to beat
+make train            # train LightGBM + show feature importance
+make tables           # what is in DuckDB
+make dbpath           # path to the file for DBeaver
 ```
 
-**На реальных данных** — те же команды, только вместо `synth` скачивание:
+**On real data** — the same commands, only download instead of `synth`:
 
 ```bash
-cp .env.example .env  # вписать KAGGLE_USERNAME / KAGGLE_KEY
-make download         # ~450 МБ с Kaggle
+cp .env.example .env  # fill in KAGGLE_USERNAME / KAGGLE_KEY
+make download         # ~450 MB from Kaggle
 make raw staging validate features baseline train
 ```
 
-Ещё не реализовано и пока упадёт с `NotImplementedError`:
+Not implemented yet, will fail with `NotImplementedError`:
 `make external`, `make backtest`, `make predict`, `make api`, `make dashboard`.
 
-Сервисы:
+Services:
 
 ```bash
 make up               # airflow (:8080) + mlflow (:5555) + postgres
-make api              # FastAPI на :8000
-make dashboard        # Streamlit на :8501
+make api              # FastAPI on :8000
+make dashboard        # Streamlit on :8501
 ```
 
-Разработка:
+Development:
 
 ```bash
 make lint
 make fmt
-make test             # без сетевых и медленных
+make test             # without network and slow tests
 make test-all
 ```
 
 ---
 
-## Просмотр данных в DBeaver
+## Browsing data in DBeaver
 
-Путь к файлу: `make dbpath`. В DBeaver — **New Database Connection → DuckDB**,
-вставить путь в **Path**.
+Path to the file: `make dbpath`. In DBeaver — **New Database Connection → DuckDB**,
+paste the path into **Path**.
 
-**Обязательно** на вкладке *Driver properties* выставить `duckdb.read_only = true`.
+**Mandatory**: on the *Driver properties* tab set `duckdb.read_only = true`.
 
-Причина: DuckDB — встраиваемая БД с блокировкой файла. Одновременно возможен
-**либо один процесс на запись, либо сколько угодно на чтение**. DBeaver,
-подключённый на запись, держит файл — и пайплайн падает с
+Reason: DuckDB is an embedded database with a file lock. At any time there can be
+**either one writer process, or any number of readers**. DBeaver connected
+in write mode holds the file — and the pipeline crashes with
 `Could not set lock on file`.
 
-| Команда | Режим | Уживается с DBeaver (read-only) |
+| Command | Mode | Coexists with DBeaver (read-only) |
 |---|---|---|
-| `make baseline`, `make train` | чтение | да |
-| `m5 db tables / peek / sql` | чтение | да |
-| `make staging`, `make features`, `make demo` | запись | нет, нужен Disconnect |
+| `make baseline`, `make train` | read | yes |
+| `m5 db tables / peek / sql` | read | yes |
+| `make staging`, `make features`, `make demo` | write | no, Disconnect first |
 
-Смотреть витрину во время обучения можно. Пересобирать её при подключённом
-DBeaver — нельзя.
+Browsing the mart during training is fine. Rebuilding it with DBeaver
+connected is not.
 
 ---
 
 ## Airflow
 
-**`m5_training`** — еженедельно, воскресенье 02:00
+**`m5_training`** — weekly, Sunday 02:00
 
 ```
 ingest → validate → external → build_features → train → backtest
-       → сравнить с прод-моделью → зарегистрировать, ЕСЛИ лучше на 1%+
+       → compare with the production model → register, IF better by 1%+
 ```
 
-Последний шаг — гейт. Новая модель не едет в прод только потому, что она новая.
-Выигрыш меньше 1% — это шум между фолдами, а не прогресс.
+The last step is a gate. A new model does not go to production just because it is new.
+A gain under 1% is noise between folds, not progress.
 
-**`m5_inference`** — ежедневно, 05:00
+**`m5_inference`** — daily, 05:00
 
 ```
-модель из registry → фичи → прогноз на 28 дней
-       → sanity-checks → витрина → фактическое качество + дрифт
+model from registry → features → 28-day forecast
+       → sanity checks → mart → actual quality + drift
 ```
 
-Sanity-checks **до** записи в витрину: нет NaN и отрицательных, число строк равно
-`n_series × 28`, объём в пределах ±40% от факта за прошлые 28 дней.
-Плохой прогноз хуже отсутствия прогноза — по нему закупят товар.
+Sanity checks **before** writing to the mart: no NaN or negatives, row count equals
+`n_series × 28`, volume within ±40% of the actuals for the previous 28 days.
+A bad forecast is worse than no forecast — goods will be ordered based on it.
 
-**`m5_external_ingest`** — ежедневно, 03:00
+**`m5_external_ingest`** — daily, 03:00
 
-Отдельным DAG'ом: внешние API падают по своим причинам, и их падение не должно
-ронять ни обучение, ни прогноз — те отработают на вчерашнем кеше.
+A separate DAG: external APIs fail for their own reasons, and their failure must not
+bring down training or inference — those will run on yesterday's cache.
 
-Все таски идемпотентны, с ретраями и алертами на падение.
+All tasks are idempotent, with retries and alerts on failure.
 
 ---
 
-## Порядок работ
+## Roadmap
 
-Не идти по шагам линейно до совершенства. Сначала — **тонкая вертикаль за 1–2 недели**:
+Do not go through the steps linearly to perfection. First — **a thin vertical slice in 1–2 weeks**:
 
 ```
-скачать данные → 5 фич → LightGBM → одна метрика → один DAG → всё в Docker
+download data → 5 features → LightGBM → one metric → one DAG → everything in Docker
 ```
 
-Даже с плохим качеством. Потом углублять каждый слой.
+Even with poor quality. Then deepen each layer.
 
-Иначе большой риск застрять на feature engineering на два месяца
-и не дойти до самого ценного — пайплайна.
+Otherwise there is a high risk of getting stuck on feature engineering for two months
+and never reaching the most valuable part — the pipeline.
 
-Ориентировочно на всё: **6–10 недель при 8–10 часах в неделю.**
+Rough total: **6–10 weeks at 8–10 hours a week.**
 
-**Сделано:**
+**Done:**
 
-1. ✅ `data/` + staging SQL → raw → stg в DuckDB, разворот wide→long
-2. ✅ `features/build.py` + ft SQL → витрина фич, проверка утечки после каждой сборки
-3. ✅ `evaluation/cv.py` → rolling origin с gap, тесты на границы фолдов
-4. ✅ `models/baseline.py` → планка зафиксирована на 4 фолдах
-5. ✅ `models/train.py` → LightGBM tweedie по магазинам, бьёт baseline
+1. ✅ `data/` + staging SQL → raw → stg in DuckDB, wide→long unpivot
+2. ✅ `features/build.py` + ft SQL → feature mart, leakage check after every build
+3. ✅ `evaluation/cv.py` → rolling origin with gap, tests on fold boundaries
+4. ✅ `models/baseline.py` → the bar is fixed on 4 folds
+5. ✅ `models/train.py` → LightGBM tweedie per store, beats the baseline
 
-**Дальше по приоритету:**
+**Next, by priority:**
 
-6. `evaluation/metrics.py::wrmsse` → метрика соревнования (сейчас только WMAPE/MAE)
-7. `models/predict.py` → инференс в `mart.forecast` + sanity-checks
-8. `evaluation/backtest.py` → прогон по всем фолдам, а не только по нулевому
-9. `models/registry.py` → MLflow Registry и гейт промоушена
-10. `external/` → погода и праздники + ablation, доказать прирост
-11. DAG'и → тела `_beats_production` и `_sanity_checks`
-12. `monitoring/`, `serving/`, дашборд
+6. `evaluation/metrics.py::wrmsse` → the competition metric (currently only WMAPE/MAE)
+7. `models/predict.py` → inference into `mart.forecast` + sanity checks
+8. `evaluation/backtest.py` → run across all folds, not just fold zero
+9. `models/registry.py` → MLflow Registry and the promotion gate
+10. `external/` → weather and holidays + ablation, prove the gain
+11. DAGs → bodies of `_beats_production` and `_sanity_checks`
+12. `monitoring/`, `serving/`, dashboard
 
 ---
 
-## Где обычно ломается
+## Where it usually breaks
 
-1. **Утечка через лаги.** Посчитал rolling mean без сдвига на горизонт.
-   Скор на валидации великолепный, на тесте катастрофа. Лечится тестами
-   из `test_leakage.py` и правилом «минимальный лаг >= горизонт».
-2. **Память.** `pd.melt` на всём датасете не работает. DuckDB или Polars.
-3. **WRMSSE.** Метрика нетривиальная: 12 уровней агрегации, веса по выручке
-   за последние 28 дней train, знаменатель RMSSE считается только по train
-   и только с первой ненулевой продажи. Разобраться, а не скопировать — иначе
-   не объяснить на собеседовании.
-4. **Товары, которых ещё не было в продаже.** Нули до первой продажи — это
-   отсутствие товара в ассортименте, а не нулевой спрос. Их надо отрезать,
-   иначе модель учится на мусоре.
-5. **Погода на инференсе.** См. раздел про внешние данные: фактической погоды
-   на 28 дней вперёд не существует. Если этого не учесть, бэктест покажет
-   улучшение, которого в проде не будет.
+1. **Leakage through lags.** Computed a rolling mean without shifting by the horizon.
+   Validation score is superb, test is a catastrophe. Cured by the tests
+   in `test_leakage.py` and the rule "minimum lag >= horizon".
+2. **Memory.** `pd.melt` on the whole dataset does not work. DuckDB or Polars.
+3. **WRMSSE.** A non-trivial metric: 12 aggregation levels, weights by revenue
+   over the last 28 days of train, the RMSSE denominator is computed only on train
+   and only from the first non-zero sale. Understand it, do not copy it — otherwise
+   you cannot explain it in an interview.
+4. **Items not yet on sale.** Zeros before the first sale mean the item
+   was not in the assortment, not zero demand. They must be cut off,
+   otherwise the model learns from garbage.
+5. **Weather at inference.** See the external data section: actual weather
+   28 days ahead does not exist. If this is ignored, the backtest will show
+   an improvement that will not happen in production.
 
 ---
 
-## Лицензия и данные
+## License and data
 
-Данные M5 принадлежат организаторам соревнования и в репозиторий не коммитятся
-(`data/` в `.gitignore`). Open-Meteo — CC BY 4.0. Nager.Date — открытый API.
+The M5 data belongs to the competition organisers and is not committed to the repository
+(`data/` is in `.gitignore`). Open-Meteo — CC BY 4.0. Nager.Date — an open API.
